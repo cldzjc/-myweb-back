@@ -3,20 +3,18 @@ package org.example.blog.controller;
 import org.example.blog.common.Result;
 import org.example.blog.entity.Media;
 import org.example.blog.entity.Post;
+import org.example.blog.entity.User;
 import org.example.blog.service.MediaService;
 import org.example.blog.repository.MediaRepository;
 import org.example.blog.repository.PostRepository;
+import org.example.blog.repository.UserRepository;
 import org.springframework.web.bind.annotation.*;
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
 import software.amazon.awssdk.services.s3.presigner.S3Presigner;
 import software.amazon.awssdk.services.s3.presigner.model.GetObjectPresignRequest;
 import software.amazon.awssdk.services.s3.presigner.model.PresignedGetObjectRequest;
-import org.springframework.security.core.annotation.AuthenticationPrincipal;
-import org.springframework.security.core.userdetails.UserDetails;
-import org.springframework.security.core.Authentication;
 import org.springframework.security.authentication.AnonymousAuthenticationToken;
-
-
+import org.springframework.security.core.Authentication;
 
 import java.security.Principal;
 import java.time.Duration;
@@ -30,33 +28,56 @@ public class MediaController {
     private final MediaRepository mediaRepository;
     private final MediaService mediaService;
     private final PostRepository postRepository;
+    private final UserRepository userRepository;   // ✅ 新增注入
     private final String bucket = "media";
 
     public MediaController(S3Presigner s3Presigner,
                            MediaRepository mediaRepository,
                            MediaService mediaService,
-                           PostRepository postRepository) {
+                           PostRepository postRepository,
+                           UserRepository userRepository) {   // ✅ 新增参数
         this.s3Presigner = s3Presigner;
         this.mediaRepository = mediaRepository;
         this.mediaService = mediaService;
         this.postRepository = postRepository;
+        this.userRepository = userRepository;       // ✅ 新增赋值
     }
 
+    /* ---------- 1. 获取上传签名 ---------- */
     /* ---------- 1. 获取上传签名 ---------- */
     @PostMapping("/presign")
     public Map<String, Object> presign(@RequestBody PresignRequest req, Authentication authentication) {
         String username = "anon";
+
         if (authentication != null && authentication.isAuthenticated()
                 && !(authentication instanceof AnonymousAuthenticationToken)) {
-            username = authentication.getName();
+            String loginName = authentication.getName();
+
+            // ✅ 从数据库中尝试查找用户（先按邮箱查，再按用户名查）
+            username = loginName; // 默认使用登录名
+
+            // ✅ 查真实用户名逻辑
+            User user = userRepository.findByEmail(loginName);
+            if (user == null) {
+                Optional<User> userOpt = userRepository.findByUsername(loginName);
+                if (userOpt.isPresent()) {
+                    username = userOpt.get().getUsername();
+                }
+            } else {
+                username = user.getUsername();
+            }
         }
 
         String key = String.format("users/%s/%s-%s", username, UUID.randomUUID(), req.filename);
 
         var putReq = software.amazon.awssdk.services.s3.model.PutObjectRequest.builder()
                 .bucket(bucket).key(key).contentType(req.mimeType).build();
+
         var presignReq = software.amazon.awssdk.services.s3.presigner.model.PutObjectPresignRequest.builder()
-                .signatureDuration(Duration.ofMinutes(15)).putObjectRequest(putReq).build();
+                .signatureDuration(Duration.ofMinutes(15))
+                .putObjectRequest(putReq)
+                .build();
+
         var presigned = s3Presigner.presignPutObject(presignReq);
 
         Map<String, Object> resp = new HashMap<>();
@@ -67,16 +88,14 @@ public class MediaController {
     }
 
 
-
-
     /* ---------- 2. 上传完成后写入数据库 ---------- */
     @PostMapping("/complete")
     public Result<Void> complete(@RequestBody CompleteReq req, Principal principal) {
-        String username = (principal != null) ? principal.getName() : "anon";
+        String email = (principal != null) ? principal.getName() : "anon";
 
         Media m = new Media();
         m.setObjectKey(req.objectKey);
-        m.setUserId(getUserId(username));
+        m.setUserId(getUserId(email));
         m.setMediaType(parseMediaType(req.mediaType));
         m.setMimeType(req.mediaType);
         m.setSizeBytes(req.sizeBytes);
@@ -92,17 +111,26 @@ public class MediaController {
             @RequestParam String title,
             @RequestParam String mediaKeys,
             @RequestParam(required = false) String content,
-            @RequestParam(required = false) String postType,  // ✅ 新增
+            @RequestParam(required = false) String postType,
             Principal principal) {
 
-        String username = (principal != null) ? principal.getName() : "anon";
+        String email = (principal != null) ? principal.getName() : "anon";
+        String authorName = email;
+
+        // ✅ 新增：用邮箱查用户名
+        if (!"anon".equals(email)) {
+            User user = userRepository.findByEmail(email);
+            if (user != null) {
+                authorName = user.getUsername();
+            }
+        }
 
         Post p = new Post();
         p.setTitle(title);
         p.setContent(content == null ? "" : content);
-        p.setAuthor(username);
+        p.setAuthor(authorName);   // ✅ 显示用户名
 
-        // ✅ 优先使用前端传的 postType
+        // ✅ 类型判断逻辑保持原样
         if (postType != null && !postType.isEmpty()) {
             switch (postType) {
                 case "video" -> p.setPostType(Post.PostType.video);
@@ -111,7 +139,6 @@ public class MediaController {
                 default -> p.setPostType(Post.PostType.text);
             }
         } else {
-            // 如果前端没传，再根据媒体类型决定
             String[] keys = mediaKeys.split(",");
             Optional<Media> firstMediaOpt = mediaRepository.findByObjectKey(keys[0]);
             if (firstMediaOpt.isPresent()) {
@@ -132,7 +159,6 @@ public class MediaController {
         return Result.okVoid();
     }
 
-
     /* ---------- 4. 获取媒体预览地址 ---------- */
     @GetMapping("/preview")
     public Result<String> preview(@RequestParam String key) {
@@ -146,9 +172,10 @@ public class MediaController {
     }
 
     /* ---------- 工具方法 ---------- */
-    private Long getUserId(String username) {
-        // TODO: 从 UserRepository 查 ID；临时写死 1L
-        return 1L;
+    private Long getUserId(String email) {
+        if (email == null || "anon".equals(email)) return 1L;
+        User user = userRepository.findByEmail(email);
+        return (user != null) ? user.getId() : 1L;
     }
 
     private Media.MediaType parseMediaType(String type) {

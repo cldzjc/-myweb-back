@@ -2,8 +2,10 @@ package org.example.blog.controller;
 
 import org.example.blog.common.Result;
 import org.example.blog.entity.Post;
+import org.example.blog.entity.User;
 import org.example.blog.repository.PostRepository;
-import org.example.blog.service.MediaService;        // ✅ 新增
+import org.example.blog.repository.UserRepository;   // ✅ 新增
+import org.example.blog.service.MediaService;
 import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.*;
 
@@ -13,14 +15,16 @@ import java.util.List;
 @RequestMapping("/posts")
 public class PostController {
 
-    /* ⬇️ 改成构造器注入，删掉 @Autowired 字段 */
     private final PostRepository postRepository;
-    private final MediaService mediaService;          // ✅ 新增
+    private final MediaService mediaService;
+    private final UserRepository userRepository;      // ✅ 新增
 
     public PostController(PostRepository postRepository,
-                          MediaService mediaService) { // ✅ 新增参数
+                          MediaService mediaService,
+                          UserRepository userRepository) {  // ✅ 新增参数
         this.postRepository = postRepository;
-        this.mediaService = mediaService;             // ✅ 新增赋值
+        this.mediaService = mediaService;
+        this.userRepository = userRepository;          // ✅ 新增赋值
     }
 
     /**
@@ -31,9 +35,19 @@ public class PostController {
         if (auth == null) {
             return Result.error("请先登录再发帖子");
         }
+
+        // ✅ 新增：通过邮箱找到用户，拿到 username
+        String loginEmail = auth.getName();
+        User user = userRepository.findByEmail(loginEmail);
+        if (user == null) {
+            return Result.error("无法找到当前登录用户");
+        }
+
         Post p = new Post();
         p.setTitle(dto.getTitle());
-        // ✅ 如果前端没传 content，就设一个默认内容
+        p.setAuthor(user.getUsername());  // ✅ 改为昵称（用户名），不再是邮箱
+
+        // ✅ 内容处理
         if (dto.getContent() == null || dto.getContent().isBlank()) {
             if (dto.getMediaKeys() != null && !dto.getMediaKeys().isBlank()) {
                 p.setContent("这是一个媒体分享帖，点击查看详情。");
@@ -44,10 +58,7 @@ public class PostController {
             p.setContent(dto.getContent());
         }
 
-
-        p.setAuthor(auth.getName());   // 当前登录用户名
-
-        // ✅ 设置类型（图片、音频、视频或纯文本）
+        // ✅ 类型判断
         if (dto.getMediaKeys() != null && !dto.getMediaKeys().isBlank()) {
             String first = dto.getMediaKeys().split(",")[0];
             if (first.endsWith("mp4")) {
@@ -61,16 +72,13 @@ public class PostController {
             p.setPostType(Post.PostType.text);
         }
 
-        postRepository.save(p);        // 先保存，拿到 id
-
-        /* ✅ 新增：把媒体记录绑定到本帖 */
+        postRepository.save(p);
         mediaService.bindToPost(p.getId(), dto.getMediaKeys());
-
-        return Result.ok();            // 统一返回工具类
+        return Result.ok();
     }
 
     /**
-     * 首页列表（最新在上）
+     * 首页列表
      */
     @GetMapping
     public Result<List<Post>> list() {
@@ -80,7 +88,13 @@ public class PostController {
     @PutMapping("/{id}")
     public Result<?> update(@PathVariable Long id, @RequestBody Post dto, Authentication auth) {
         Post p = postRepository.findById(id).orElseThrow();
-        if (!p.getAuthor().equals(auth.getName())) return Result.error("只能修改自己的帖");
+
+        // 获取当前登录用户的用户名
+        User user = userRepository.findByEmail(auth.getName());
+        if (user == null || !p.getAuthor().equals(user.getUsername())) {
+            return Result.error("只能修改自己的帖");
+        }
+
         p.setTitle(dto.getTitle());
         p.setContent(dto.getContent());
         postRepository.save(p);
@@ -90,15 +104,16 @@ public class PostController {
     @DeleteMapping("/{id}")
     public Result<?> delete(@PathVariable Long id, Authentication auth) {
         Post p = postRepository.findById(id).orElseThrow();
-        if (!p.getAuthor().equals(auth.getName())) return Result.error("只能删除自己的帖");
 
-        // ✅ 1. 先查出媒体记录
+        // 获取当前登录用户的用户名
+        User user = userRepository.findByEmail(auth.getName());
+        if (user == null || !p.getAuthor().equals(user.getUsername())) {
+            return Result.error("只能删除自己的帖");
+        }
+
+        // 删除帖子的媒体和帖子
         var medias = mediaService.findByPostId(id);
-
-        // ✅ 2. 先删数据库帖子
         postRepository.deleteById(id);
-
-        // ✅ 3. 再删 MinIO 文件
         if (!medias.isEmpty()) {
             mediaService.deleteFromMinio(medias);
         }
